@@ -3,7 +3,9 @@
 #include <linux/input.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/signalfd.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -99,7 +101,8 @@ bool wait_for_retry(int signal_fd) {
 // Zero means shutdown; a positive errno means the connection was lost.
 int listen_to_device(
     libevdev* device, int device_fd, int signal_fd, Database& database,
-    std::unordered_map<std::string, std::uint64_t>& press_counts) {
+    std::unordered_map<std::string, std::uint64_t>& press_counts,
+    bool verbose) {
   bool syncing = false;
   input_event event{};
   while (!stop_requested(signal_fd)) {
@@ -166,8 +169,10 @@ int listen_to_device(
       const auto next_count = count + 1;
       database.save_count(key_name, next_count);
       count = next_count;
-      std::printf("%s %" PRIu64 "\n", key_name.c_str(), count);
-      std::fflush(stdout);
+      if (verbose) {
+        std::printf("%s %" PRIu64 "\n", key_name.c_str(), count);
+        std::fflush(stdout);
+      }
     }
   }
   return 0;
@@ -180,14 +185,18 @@ int main(int argc, char* argv[]) {
     std::string device_path;
     std::string database_path = "./stats.db";
     bool database_path_set = false;
+    bool verbose = false;
     const auto usage = [&] {
-      std::fprintf(stderr, "Usage: %s /dev/input/eventX [--db PATH]\n",
+      std::fprintf(stderr,
+                   "Usage: %s /dev/input/eventX [--db PATH] [--verbose]\n",
                    argv[0]);
       return 1;
     };
     for (int i = 1; i < argc; ++i) {
       const std::string argument = argv[i];
-      if (argument == "--db") {
+      if (argument == "--verbose") {
+        verbose = true;
+      } else if (argument == "--db") {
         if (database_path_set || i + 1 == argc || argv[i + 1][0] == '\0' ||
             argv[i + 1][0] == '-') {
           return usage();
@@ -204,6 +213,11 @@ int main(int argc, char* argv[]) {
     if (device_path.empty()) {
       return usage();
     }
+    if (database_path == ":memory:" || database_path.rfind("file:", 0) == 0) {
+      throw std::runtime_error(
+          "Database path must name a local file, not an in-memory database or "
+          "SQLite URI");
+    }
 
     // Receive termination signals through the event loop, including while idle.
     sigset_t signal_mask;
@@ -219,8 +233,38 @@ int main(int argc, char* argv[]) {
       fail("Create signal descriptor", errno);
     }
 
+    // Keep the lock alive longer than SQLite, including during reconnect waits.
+    const ScopedFd database_lock(
+        open(database_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666));
+    if (database_lock.get() < 0) {
+      throw std::runtime_error("Open database for locking '" + database_path +
+                               "': " + std::strerror(errno));
+    }
+    struct stat database_stat{};
+    if (fstat(database_lock.get(), &database_stat) < 0) {
+      throw std::runtime_error("Inspect database '" + database_path +
+                               "': " + std::strerror(errno));
+    }
+    if (!S_ISREG(database_stat.st_mode)) {
+      throw std::runtime_error("Database '" + database_path +
+                               "' must be a regular file");
+    }
+    while (flock(database_lock.get(), LOCK_EX | LOCK_NB) < 0) {
+      const int error = errno;
+      if (error == EINTR) {
+        continue;
+      }
+      if (error == EWOULDBLOCK) {
+        throw std::runtime_error("Database '" + database_path +
+                                 "' is already in use by another instance");
+      }
+      throw std::runtime_error("Lock database '" + database_path +
+                               "': " + std::strerror(error));
+    }
+
     Database database(database_path);
     auto press_counts = database.load_counts();
+    std::fprintf(stderr, "Started; database: %s\n", database_path.c_str());
     bool connected_before = false;
     int last_error = 0;
     while (!stop_requested(signal_fd.get())) {
@@ -242,20 +286,20 @@ int main(int argc, char* argv[]) {
             error = -rc;
           } else {
             const char* name = libevdev_get_name(device.get());
-            std::printf(
-                "%s: %s\n",
+            std::fprintf(
+                stderr, "%s: %s\n",
                 connected_before ? "Device reconnected" : "Start listening",
                 name ? name : "UNKNOWN");
-            std::fflush(stdout);
             connected_before = true;
             last_error = 0;
-            error = listen_to_device(device.get(), device_fd.get(),
-                                     signal_fd.get(), database, press_counts);
+            error =
+                listen_to_device(device.get(), device_fd.get(), signal_fd.get(),
+                                 database, press_counts, verbose);
           }
         }
       }  // Release libevdev before closing its fd, before any retry wait.
       if (error == 0 || stop_requested(signal_fd.get())) {
-        return 0;
+        break;
       }
       if (error == EINTR) {
         continue;
@@ -271,9 +315,10 @@ int main(int argc, char* argv[]) {
         last_error = error;
       }
       if (wait_for_retry(signal_fd.get())) {
-        return 0;
+        break;
       }
     }
+    std::fprintf(stderr, "Stopping monitor.\n");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());
