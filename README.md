@@ -3,7 +3,7 @@
 Linux 键盘按键计数程序，使用 libevdev 读取输入，并通过 SQLite 保存累计次数。
 采用 C++20、Clang、libc++、CMake 和 Ninja 构建，需要 libevdev 和 SQLite
 开发库（SQLite ≥ 3.24）。项目同时提供独立的只读程序 `KeyboardEyesViewer`，
-定时查询数据库并在终端完整打印按键计数。默认启用测试，配置时还需要 Python 3
+定时查询数据库，在终端显示键盘热力图或完整的按键计数表格。默认启用测试，配置时还需要 Python 3
 （含标准库 sqlite3）；仅构建程序时可以指定 `-DBUILD_TESTING=OFF`。
 
 ## 编译与运行
@@ -74,6 +74,8 @@ KEY_A 2
 
 ```bash
 ./build/KeyboardEyesViewer --db ./stats.db --interval 5
+./build/KeyboardEyesViewer --db ./stats.db --view keyboard
+./build/KeyboardEyesViewer --db ./stats.db --view table
 ./build/KeyboardEyesViewer --help
 ```
 
@@ -83,8 +85,43 @@ KEY_A 2
 程序以只读方式打开文件，不创建数据库、不初始化表、不修改日志模式，也不申请采集端的
 `flock` 锁。运行期间不要替换数据库文件或更改路径指向。
 
+`--view` 支持以下三种模式，默认为 `auto`：
+
+| 模式 | 行为 |
+| --- | --- |
+| `auto` | stdout 为 TTY，且 `TERM` 包含 `256color` 或 `COLORTERM` 为 `truecolor` / `24bit` 时显示热力图；否则输出表格。`TERM` 为空或 `dumb` 时也使用表格。 |
+| `keyboard` | 显式使用热力图，要求 stdout 为 TTY，且 `TERM` 非空、非 `dumb`。适合已确认支持 256 色但没有对应环境标记的终端。 |
+| `table` | 始终输出完整表格，不输出终端控制序列。 |
+
 启动后立即读取一次，每轮结束后等待指定间隔，再读取最新已提交的数据。
-每次成功都向 stdout 追加 `key_counts` 的全部三列和全部记录，按 `id` 升序排列，
+重定向到文件或管道时，默认自动使用表格；显式 `--view keyboard` 不支持重定向。
+
+### 键盘热力图
+
+采用固定的美式 ANSI 104 键布局，包含功能键、主键区、导航区、方向键和数字小键盘。
+键帽只显示名称，以背景色表示**数据库累计次数**，不是当前按住状态，也不是最近一个周期的增量。
+左右 Ctrl/Shift/Alt/Win、主键区和数字小键盘分别统计；未出现的键按零次显示。
+Print Screen 对应 `KEY_SYSRQ`，菜单键对应 `KEY_COMPOSE`。不自动识别实际键盘布局。
+
+画面至少需要 **140 列 × 33 行**，可通过放大终端或缩小字号容纳。
+窗口不足时显示所需尺寸和当前尺寸，仍按周期读取数据；恢复尺寸后立即展示最近快照。
+窗口缩放触发原地重绘，不额外查询数据库，也不推迟原有刷新期限。
+
+灰色表示零次，其余为从浅黄到红色的八档暖色。设某键次数为 `n`、布局内最大次数为 `M`，
+正数计数的档位为 `min(7, floor(8 * log1p(n) / log1p(M)))`。
+每轮按当前快照重新计算相对热度，使低频键在高频键存在时仍有区分；全零时均显示灰色。
+底部显示图例、布局内最大次数、前五名高频键及准确次数、未映射记录数和运行状态。
+同次数的高频键按数据库键名排序；布局外的记录不参与颜色或高频榜，可用表格模式查看。
+读取时间使用 UTC，按键次数保留完整整数精度。
+
+热力图使用 ANSI 256 色和备用屏幕，进入时隐藏光标，退出时恢复颜色、光标及原屏幕。
+每帧先在内存中组装，再统一输出，按原位置刷新；不修改输入模式，不读取普通按键。
+界面采用 ASCII 边框、英文缩写和状态文本，以保持字符宽度一致。
+支持 Ctrl+C 和 SIGTERM；不可捕获的 SIGKILL 无法执行终端恢复。
+
+### 完整表格
+
+表格模式每次成功都向 stdout 追加 `key_counts` 的全部三列和全部记录，按 `id` 升序排列，
 即使数据没有变化也会完整打印并刷新输出。时间戳使用 UTC，例如：
 
 ```text
@@ -100,11 +137,12 @@ Rows: 2
 反斜杠转义为 `\\`，防止打乱表格，不截断字段。
 
 查询先将完整数据读入内存并释放查询及读事务，再格式化、打印；查询失败不会打印半张表。
-读取端设置 200 毫秒的锁等待；遇到 SQLite busy/locked 错误时向 stderr 报告，
-等待下个周期重试。文件不存在、权限不足、缺失所需列、字段类型错误、负数计数或数据库损坏
+读取端设置 200 毫秒的锁等待；遇到 SQLite busy/locked 错误时，表格模式向 stderr 报告，
+热力图在状态区提示，保留上次成功的快照和时间，等待下个周期重试。
+首次读取尚未成功时明确显示等待状态。文件不存在、权限不足、缺失所需列、字段类型错误、负数计数或数据库损坏
 等错误会报告原因并以状态码 `1` 退出。标准输出写入失败也会报错退出。
 按 Ctrl+C 或发送 SIGTERM 正常退出返回 `0`，无需等到轮询间隔结束。
-启动、停止和错误日志均输出至 stderr。
+启动、停止和不可恢复错误输出至 stderr；热力图退出时先恢复终端，再输出结束或错误信息。
 
 **并发限制：现有采集程序没有配置 SQLite 锁等待。** 读取程序已尽量缩短读锁时间，
 但在当前回滚日志模式下，仍可能与采集端写入竞争锁，导致采集端报错退出。
@@ -127,8 +165,10 @@ sudo -u keyboardeyes ./build/KeyboardEyesViewer --db /var/lib/keyboardeyes/stats
 不会为读取程序创建 systemd 服务。
 
 读取程序代码位于 `src/viewer/`：`DatabaseReader::read_snapshot()` 返回包含读取时间及
-全部记录的独立快照，`print_snapshot(snapshot, ostream)` 负责终端展示，`main.cpp`
-负责参数、轮询和信号处理。未来可视化可接收同一快照，替换展示层。
+全部记录的独立快照，`print_snapshot(snapshot, ostream)` 负责表格展示。
+`keyboard_layout` 定义键位，`heatmap_renderer` 将快照转换为完整 ANSI 画面，
+`terminal_session` 管理终端能力、尺寸及恢复，`main.cpp` 负责参数、轮询和信号分发。
+渲染计算不访问数据库、不直接操作终端，后续展示方式可复用相同快照。
 
 ## 设备断开与重连
 
@@ -151,7 +191,7 @@ sudo -u keyboardeyes ./build/KeyboardEyesViewer --db /var/lib/keyboardeyes/stats
 
 ## 测试
 
-运行三项原有数据库测试（建表、查询与修改、加载）及读取程序集成测试：
+运行数据库测试、读取程序集成测试、热力图渲染测试和终端集成测试：
 
 ```bash
 (cd build && ctest --output-on-failure)
@@ -164,6 +204,15 @@ sudo -u keyboardeyes ./build/KeyboardEyesViewer --db /var/lib/keyboardeyes/stats
 
 ```bash
 python3 tests/viewer_test.py --viewer ./build/KeyboardEyesViewer -v
+```
+
+热力图单元测试验证 104 键布局、映射、色阶、高频榜、极值和画面边界。
+终端集成测试使用 Python 标准库 `pty` 创建伪终端，验证模式选择、刷新、窗口缩放、
+锁竞争保留旧帧、异常退出恢复和输出错误；无需额外 Python 包：
+
+```bash
+./build/heatmap_test
+python3 tests/terminal_test.py --viewer ./build/KeyboardEyesViewer -v
 ```
 
 部署脚本的隔离测试需要 Python 3，通过临时目录及模拟系统命令验证安装和回滚，
@@ -267,5 +316,6 @@ clang-format-23 -i src/main.cpp
 ```
 
 添加新的源文件时，将其加入 `CMakeLists.txt` 中对应目标的 `add_executable` 或
-`add_library` 列表。`KeyboardEyesViewer` 链接独立的 `keyboardeyes_reader` 静态库和
-SQLite，不链接 libevdev 或采集端写入库；整体项目配置仍需要 libevdev 开发包。
+`add_library` 列表。`KeyboardEyesViewer` 链接 `keyboardeyes_terminal`、
+`keyboardeyes_reader` 静态库和 SQLite，不链接 libevdev 或采集端写入库；
+热力图没有新增第三方运行依赖，整体项目配置仍需要 libevdev 开发包。

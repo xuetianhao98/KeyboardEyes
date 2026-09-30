@@ -59,8 +59,15 @@ target_compile_options(keyboardeyes_reader PUBLIC -stdlib=libc++)
 target_compile_options(keyboardeyes_reader PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(keyboardeyes_reader INTERFACE -stdlib=libc++)
 
+add_library(keyboardeyes_terminal STATIC
+    src/viewer/keyboard_layout.cpp
+    src/viewer/heatmap_renderer.cpp
+    src/viewer/terminal_session.cpp)
+target_link_libraries(keyboardeyes_terminal PUBLIC keyboardeyes_reader)
+target_compile_options(keyboardeyes_terminal PRIVATE -Wall -Wextra -Wpedantic)
+
 add_executable(KeyboardEyesViewer src/viewer/main.cpp)
-target_link_libraries(KeyboardEyesViewer PRIVATE keyboardeyes_reader)
+target_link_libraries(KeyboardEyesViewer PRIVATE keyboardeyes_terminal)
 target_compile_options(KeyboardEyesViewer PRIVATE -Wall -Wextra -Wpedantic)
 
 include(CTest)
@@ -77,4 +84,13 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/viewer_test.py"
                 --viewer $<TARGET_FILE:KeyboardEyesViewer>)
     set_tests_properties(viewer_integration PROPERTIES TIMEOUT 90)
+
+    add_executable(heatmap_test tests/heatmap_test.cpp)
+    target_link_libraries(heatmap_test PRIVATE keyboardeyes_terminal)
+    target_compile_options(heatmap_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME heatmap_rendering COMMAND heatmap_test)
+    add_test(NAME terminal_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/terminal_test.py"
+                --viewer $<TARGET_FILE:KeyboardEyesViewer>)
+    set_tests_properties(terminal_integration PROPERTIES TIMEOUT 90)
 endif()

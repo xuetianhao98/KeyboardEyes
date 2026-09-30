@@ -9,11 +9,14 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
 #include "database_reader.h"
+#include "heatmap_renderer.h"
 #include "table_printer.h"
+#include "terminal_session.h"
 
 namespace {
 
@@ -38,18 +41,26 @@ class ScopedFd {
                            std::strerror(errno));
 }
 
-bool stop_requested(int signal_fd) {
+struct Signals {
+  bool stop = false;
+  bool resize = false;
+};
+
+Signals pending_signals(int signal_fd) {
+  Signals result;
   signalfd_siginfo signal{};
   while (true) {
     const ssize_t size = read(signal_fd, &signal, sizeof(signal));
     if (size == sizeof(signal)) {
-      return true;
+      result.stop |= signal.ssi_signo == SIGINT || signal.ssi_signo == SIGTERM;
+      result.resize |= signal.ssi_signo == SIGWINCH;
+      continue;
     }
     if (size < 0 && errno == EINTR) {
       continue;
     }
     if (size < 0 && errno == EAGAIN) {
-      return false;
+      return result;
     }
     if (size < 0) {
       fail("Read exit signal");
@@ -58,12 +69,12 @@ bool stop_requested(int signal_fd) {
   }
 }
 
-bool wait_for_next_read(int signal_fd, std::chrono::seconds interval) {
-  const auto deadline = std::chrono::steady_clock::now() + interval;
-  while (!stop_requested(signal_fd)) {
+void wait_for_event(int signal_fd,
+                    std::chrono::steady_clock::time_point deadline) {
+  while (true) {
     const auto remaining = deadline - std::chrono::steady_clock::now();
     if (remaining <= std::chrono::steady_clock::duration::zero()) {
-      return false;
+      return;
     }
     const int timeout = static_cast<int>(
         std::chrono::ceil<std::chrono::milliseconds>(remaining).count());
@@ -77,16 +88,19 @@ bool wait_for_next_read(int signal_fd, std::chrono::seconds interval) {
     if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) {
       throw std::runtime_error("Exit signal descriptor became unavailable");
     }
+    return;
   }
-  return true;
 }
 
 void print_usage(const char* program, std::ostream& output) {
-  output << "Usage: " << program
-         << " [--db PATH] [--interval SECONDS] [--help]\n"
-         << "Defaults: --db ./stats.db --interval 5\n"
-         << "SECONDS must be an integer in 1.."
-         << std::numeric_limits<int>::max() / 1000 << ".\n";
+  output
+      << "Usage: " << program
+      << " [--db PATH] [--interval SECONDS] [--view auto|keyboard|table] "
+         "[--help]\n"
+      << "Defaults: --db ./stats.db --interval 5 --view auto\n"
+      << "Auto uses a keyboard heatmap on a 256-color TTY, otherwise a table.\n"
+      << "SECONDS must be an integer in 1.."
+      << std::numeric_limits<int>::max() / 1000 << ".\n";
 }
 
 }  // namespace
@@ -97,13 +111,16 @@ int main(int argc, char* argv[]) {
     int interval_seconds = 5;
     bool path_set = false;
     bool interval_set = false;
+    bool view_set = false;
+    viewer::ViewMode view_mode = viewer::ViewMode::Auto;
     for (int index = 1; index < argc; ++index) {
       const std::string argument = argv[index];
       if (argument == "--help") {
         print_usage(argv[0], std::cout);
         return 0;
       }
-      if (argument != "--db" && argument != "--interval") {
+      if (argument != "--db" && argument != "--interval" &&
+          argument != "--view") {
         throw std::invalid_argument("Unknown argument: " + argument);
       }
       if (index + 1 == argc || argv[index + 1][0] == '\0' ||
@@ -117,6 +134,12 @@ int main(int argc, char* argv[]) {
         }
         database_path = value;
         path_set = true;
+      } else if (argument == "--view") {
+        if (view_set) {
+          throw std::invalid_argument("Repeated --view option");
+        }
+        view_mode = viewer::parse_view_mode(value);
+        view_set = true;
       } else {
         if (interval_set) {
           throw std::invalid_argument("Repeated --interval option");
@@ -132,10 +155,12 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    const bool keyboard_view = viewer::use_keyboard_view(view_mode);
     sigset_t signal_mask;
     sigemptyset(&signal_mask);
     sigaddset(&signal_mask, SIGINT);
     sigaddset(&signal_mask, SIGTERM);
+    sigaddset(&signal_mask, SIGWINCH);
     if (sigprocmask(SIG_BLOCK, &signal_mask, nullptr) < 0) {
       fail("Block exit signals");
     }
@@ -155,22 +180,48 @@ int main(int argc, char* argv[]) {
     viewer::DatabaseReader reader(database_path);
     std::cerr << "Started viewer; database: " << database_path
               << "; interval: " << interval_seconds << " seconds\n";
-    while (!stop_requested(signal_fd.get())) {
-      try {
-        const auto snapshot = reader.read_snapshot();
-        if (stop_requested(signal_fd.get())) {
-          break;
+    {
+      // Scope the alternate screen so both normal and exceptional exits restore
+      // it before the final stderr message is printed.
+      viewer::TerminalSession terminal(keyboard_view);
+      std::optional<viewer::DatabaseSnapshot> snapshot;
+      std::string status = "Waiting for first successful read";
+      auto deadline = std::chrono::steady_clock::now();
+      while (true) {
+        const auto signals = pending_signals(signal_fd.get());
+        if (signals.stop) break;
+        bool redraw = keyboard_view && signals.resize;
+        const bool read_due = std::chrono::steady_clock::now() >= deadline;
+        bool read_succeeded = false;
+        if (read_due) {
+          try {
+            snapshot = reader.read_snapshot();
+            status = "Read successful";
+            read_succeeded = true;
+          } catch (const viewer::DatabaseReadError& error) {
+            if (!error.retryable()) throw;
+            status = "Read busy; retrying next interval. " +
+                     std::string(error.what());
+            if (!keyboard_view) {
+              std::cerr << error.what() << "; retrying next interval\n";
+            }
+          }
+          redraw = keyboard_view;
         }
-        viewer::print_snapshot(snapshot, std::cout);
-      } catch (const viewer::DatabaseReadError& error) {
-        if (!error.retryable()) {
-          throw;
+        const auto after_read = pending_signals(signal_fd.get());
+        if (after_read.stop) break;
+        redraw |= keyboard_view && after_read.resize;
+        if (redraw) {
+          terminal.present(viewer::render_heatmap(
+              snapshot ? &*snapshot : nullptr, terminal.size(), status));
+        } else if (read_succeeded) {
+          viewer::print_snapshot(*snapshot, std::cout);
         }
-        std::cerr << error.what() << "; retrying next interval\n";
-      }
-      if (wait_for_next_read(signal_fd.get(),
-                             std::chrono::seconds(interval_seconds))) {
-        break;
+        if (read_due) {
+          deadline = std::chrono::steady_clock::now() +
+                     std::chrono::seconds(interval_seconds);
+        }
+        wait_for_event(signal_fd.get(), deadline);
       }
     }
     std::cerr << "Stopping viewer.\n";
