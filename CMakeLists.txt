@@ -50,6 +50,19 @@ target_compile_options(keyboardeyes_database PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(keyboardeyes_database INTERFACE -stdlib=libc++)
 target_link_libraries(KeyboardEyes PRIVATE keyboardeyes_database)
 
+add_library(keyboardeyes_reader STATIC
+    src/viewer/database_reader.cpp
+    src/viewer/table_printer.cpp)
+target_include_directories(keyboardeyes_reader PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer")
+target_link_libraries(keyboardeyes_reader PRIVATE SQLite::SQLite3)
+target_compile_options(keyboardeyes_reader PUBLIC -stdlib=libc++)
+target_compile_options(keyboardeyes_reader PRIVATE -Wall -Wextra -Wpedantic)
+target_link_options(keyboardeyes_reader INTERFACE -stdlib=libc++)
+
+add_executable(KeyboardEyesViewer src/viewer/main.cpp)
+target_link_libraries(KeyboardEyesViewer PRIVATE keyboardeyes_reader)
+target_compile_options(KeyboardEyesViewer PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(database_test tests/database_test.cpp)
@@ -58,4 +71,10 @@ if(BUILD_TESTING)
     add_test(NAME database_create_table COMMAND database_test create_table)
     add_test(NAME database_query_update COMMAND database_test query_update)
     add_test(NAME database_load_counts COMMAND database_test load_counts)
+
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME viewer_integration
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/viewer_test.py"
+                --viewer $<TARGET_FILE:KeyboardEyesViewer>)
+    set_tests_properties(viewer_integration PROPERTIES TIMEOUT 90)
 endif()

@@ -2,7 +2,9 @@
 
 Linux 键盘按键计数程序，使用 libevdev 读取输入，并通过 SQLite 保存累计次数。
 采用 C++20、Clang、libc++、CMake 和 Ninja 构建，需要 libevdev 和 SQLite
-开发库（SQLite ≥ 3.24）。
+开发库（SQLite ≥ 3.24）。项目同时提供独立的只读程序 `KeyboardEyesViewer`，
+定时查询数据库并在终端完整打印按键计数。默认启用测试，配置时还需要 Python 3
+（含标准库 sqlite3）；仅构建程序时可以指定 `-DBUILD_TESTING=OFF`。
 
 ## 编译与运行
 
@@ -66,6 +68,68 @@ KEY_A 2
 运行期间不要替换数据库文件或更改路径指向。锁是采集进程之间的协作约定，不阻止普通 SQLite
 工具查询，但查询仍受 SQLite 自身事务锁约束；当前未配置 WAL 或锁等待超时。
 
+## 定时读取与终端展示
+
+构建后运行独立程序，不需要访问键盘设备：
+
+```bash
+./build/KeyboardEyesViewer --db ./stats.db --interval 5
+./build/KeyboardEyesViewer --help
+```
+
+`--db` 默认为**启动工作目录**下的 `./stats.db`，`--interval` 默认为 5 秒，
+支持 1 到 2147483 的正整数秒；参数顺序任意，但不允许重复指定。
+数据库必须是已经存在的本地普通文件，不支持 `:memory:` 或 SQLite URI。
+程序以只读方式打开文件，不创建数据库、不初始化表、不修改日志模式，也不申请采集端的
+`flock` 锁。运行期间不要替换数据库文件或更改路径指向。
+
+启动后立即读取一次，每轮结束后等待指定间隔，再读取最新已提交的数据。
+每次成功都向 stdout 追加 `key_counts` 的全部三列和全部记录，按 `id` 升序排列，
+即使数据没有变化也会完整打印并刷新输出。时间戳使用 UTC，例如：
+
+```text
+Table: key_counts | Read at: 2026-09-30T09:00:00Z
+| id | key_name  | press_count |
+| 1  | KEY_A     | 12          |
+| 2  | KEY_ENTER | 7           |
+Rows: 2
+```
+
+空表仍输出表头和 `Rows: 0`；不打印 `sqlite_sequence` 等内部表。
+计数保留完整的 64 位整数精度。异常按键名中的控制字符、竖线转义为 `\xHH`，
+反斜杠转义为 `\\`，防止打乱表格，不截断字段。
+
+查询先将完整数据读入内存并释放查询及读事务，再格式化、打印；查询失败不会打印半张表。
+读取端设置 200 毫秒的锁等待；遇到 SQLite busy/locked 错误时向 stderr 报告，
+等待下个周期重试。文件不存在、权限不足、缺失所需列、字段类型错误、负数计数或数据库损坏
+等错误会报告原因并以状态码 `1` 退出。标准输出写入失败也会报错退出。
+按 Ctrl+C 或发送 SIGTERM 正常退出返回 `0`，无需等到轮询间隔结束。
+启动、停止和错误日志均输出至 stderr。
+
+**并发限制：现有采集程序没有配置 SQLite 锁等待。** 读取程序已尽量缩短读锁时间，
+但在当前回滚日志模式下，仍可能与采集端写入竞争锁，导致采集端报错退出。
+读取端的锁等待只能处理自身读取失败，无法改变采集端行为；本次未修改采集程序。
+
+读取 systemd 服务数据库时需要明确指定路径，并使用有权读取文件及遍历父目录的账户：
+
+```bash
+./build/KeyboardEyesViewer --db /var/lib/keyboardeyes/stats.db --interval 5
+```
+
+默认服务数据目录属于 `keyboardeyes:keyboardeyes`，权限为 0750，普通账户可能无法访问。
+如果有 sudo 授权，并且服务账户能够访问构建产物，可使用：
+
+```bash
+sudo -u keyboardeyes ./build/KeyboardEyesViewer --db /var/lib/keyboardeyes/stats.db
+```
+
+程序不会自动提升权限或更改文件权限。现有部署脚本仍只安装和启动采集程序，
+不会为读取程序创建 systemd 服务。
+
+读取程序代码位于 `src/viewer/`：`DatabaseReader::read_snapshot()` 返回包含读取时间及
+全部记录的独立快照，`print_snapshot(snapshot, ostream)` 负责终端展示，`main.cpp`
+负责参数、轮询和信号处理。未来可视化可接收同一快照，替换展示层。
+
 ## 设备断开与重连
 
 启动时设备尚未连接，或运行期间设备断开，程序会保持运行，每隔 2 秒重新打开指定路径，
@@ -87,10 +151,19 @@ KEY_A 2
 
 ## 测试
 
-运行已有三项数据库测试（建表、查询与修改、加载）：
+运行三项原有数据库测试（建表、查询与修改、加载）及读取程序集成测试：
 
 ```bash
 (cd build && ctest --output-on-failure)
+```
+
+读取程序测试通过 Python 3 启动真实进程，使用临时 SQLite 数据库，覆盖完整输出、
+定时更新、空表、只读行为、无效参数和数据、权限错误、锁竞争恢复、采集端 `flock`、
+信号退出和输出失败；不会访问服务数据库或真实键盘。root 运行时跳过权限拒绝用例。
+也可以单独执行：
+
+```bash
+python3 tests/viewer_test.py --viewer ./build/KeyboardEyesViewer -v
 ```
 
 部署脚本的隔离测试需要 Python 3，通过临时目录及模拟系统命令验证安装和回滚，
@@ -102,7 +175,7 @@ python3 tests/deploy_test.py
 
 ## systemd 一键部署
 
-在项目中执行以下命令即可构建 Release、运行数据库测试、安装并启动系统服务，
+在项目中执行以下命令即可构建 Release、运行 CTest、安装并启动采集系统服务，
 同时启用开机自启动。替换为自己的键盘稳定路径：
 
 ```bash
@@ -113,7 +186,7 @@ python3 tests/deploy_test.py
 系统安装阶段由 sudo 提权；也支持 root 直接执行。脚本不自动安装依赖软件包。
 需要正在运行的 systemd、`input` 组，以及 Bash、CMake、Ninja、CTest、pkg-config、
 Clang/libc++、libevdev/SQLite 开发库和 sudo（非 root）、useradd、runuser、flock、
-ldd、systemd-analyze 等系统工具。服务配置以本机 systemd 245 为验证基线。
+Python 3（含 sqlite3）、ldd、systemd-analyze 等系统工具。服务配置以本机 systemd 245 为验证基线。
 
 Release 产物独立保存在 `build/deploy`，不改变现有调试构建。部署位置固定为：
 
@@ -162,7 +235,8 @@ sudo systemctl start keyboardeyes
 
 ## 工具链说明
 
-源码位于 `src/main.cpp`。默认工具链优先使用 `clang++-23`，其次使用
+采集入口位于 `src/main.cpp`，独立读取程序位于 `src/viewer/`。
+默认工具链优先使用 `clang++-23`，其次使用
 `clang++`；当前机器已安装 Clang 23、CMake 3.16 和 Ninja。
 编译和链接均显式指定 `-stdlib=libc++`，配置阶段检查 C++20 和
 `_LIBCPP_VERSION`，并验证 libc++ 可以成功链接。当前机器已安装
@@ -192,4 +266,6 @@ VS Code 可安装工作区推荐的 clangd 和 CMake Tools 扩展。
 clang-format-23 -i src/main.cpp
 ```
 
-添加新的源文件时，将其加入 `CMakeLists.txt` 的 `add_executable` 列表。
+添加新的源文件时，将其加入 `CMakeLists.txt` 中对应目标的 `add_executable` 或
+`add_library` 列表。`KeyboardEyesViewer` 链接独立的 `keyboardeyes_reader` 静态库和
+SQLite，不链接 libevdev 或采集端写入库；整体项目配置仍需要 libevdev 开发包。
