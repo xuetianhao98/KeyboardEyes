@@ -1,0 +1,24 @@
+# Managed by KeyboardEyes scripts/deploy.sh
+[Unit]
+Description=KeyboardEyes keyboard press counter
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=keyboardeyes
+Group=keyboardeyes
+SupplementaryGroups=input
+EnvironmentFile=/etc/default/keyboardeyes
+ExecStart=/usr/local/bin/KeyboardEyes ${KEYBOARDEYES_DEVICE} --db /var/lib/keyboardeyes/stats.db
+StateDirectory=keyboardeyes
+StateDirectoryMode=0750
+UMask=0027
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

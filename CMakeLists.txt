@@ -35,10 +35,10 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBEVDEV REQUIRED IMPORTED_TARGET libevdev)
 
-add_executable(hello_world src/main.cpp)
-target_link_libraries(hello_world PRIVATE PkgConfig::LIBEVDEV)
-target_compile_options(hello_world PRIVATE -stdlib=libc++ -Wall -Wextra -Wpedantic)
-target_link_options(hello_world PRIVATE -stdlib=libc++)
+add_executable(KeyboardEyes src/main.cpp)
+target_link_libraries(KeyboardEyes PRIVATE PkgConfig::LIBEVDEV)
+target_compile_options(KeyboardEyes PRIVATE -stdlib=libc++ -Wall -Wextra -Wpedantic)
+target_link_options(KeyboardEyes PRIVATE -stdlib=libc++)
 
 find_package(SQLite3 3.24 REQUIRED)
 
@@ -48,7 +48,7 @@ target_link_libraries(keyboardeyes_database PRIVATE SQLite::SQLite3)
 target_compile_options(keyboardeyes_database PUBLIC -stdlib=libc++)
 target_compile_options(keyboardeyes_database PRIVATE -Wall -Wextra -Wpedantic)
 target_link_options(keyboardeyes_database INTERFACE -stdlib=libc++)
-target_link_libraries(hello_world PRIVATE keyboardeyes_database)
+target_link_libraries(KeyboardEyes PRIVATE keyboardeyes_database)
 
 include(CTest)
 if(BUILD_TESTING)
