@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake *)",
+      "Bash(ctest *)",
+      "Bash(clang-format-23 *)",
+      "Bash(python3 tests/*)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)"
+    ],
+    "deny": [
+      "Bash(sudo *)",
+      "Bash(systemctl *)",
+      "Bash(scripts/deploy.sh *)",
+      "Bash(./scripts/deploy.sh *)",
+      "Bash(bash scripts/deploy.sh *)",
+      "Read(//var/lib/keyboardeyes/**)",
+      "Edit(//var/lib/keyboardeyes/**)",
+      "Edit(//etc/systemd/**)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_response.filePath // .tool_input.file_path' | { read -r f; case \"$f\" in *.cpp|*.h|*.hpp|*.cc) clang-format-23 -i \"$f\";; esac; } 2>/dev/null || true",
+            "statusMessage": "clang-format"
+          }
+        ]
+      }
+    ]
+  }
+}
